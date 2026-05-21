@@ -1,0 +1,10 @@
+
+
+[workspace]
+
+resolver = "3"
+
+members = [
+    "MzansiLM/src-tauri",
+    "lib/bitnet_rs",
+]

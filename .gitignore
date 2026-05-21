@@ -1,0 +1,10 @@
+# .env
+/.env
+
+# Rust build artifacts
+/target
+/*/target
+/*/*/target
+/*/*/*/target
+
+/models/*
