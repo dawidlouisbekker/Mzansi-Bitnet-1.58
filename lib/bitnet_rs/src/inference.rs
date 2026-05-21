@@ -26,6 +26,7 @@ pub struct InferenceConfig {
     pub messages: Vec<ChatMessage>,
     pub max_new_tokens: usize,
     pub temperature: f64,
+    pub top_p: f64,
 }
 
 impl Default for InferenceConfig {
@@ -34,7 +35,8 @@ impl Default for InferenceConfig {
             model_path: "./models/bitnet-b1.58-2b-4t-bf16".into(),
             messages: Vec::new(),
             max_new_tokens: 256,
-            temperature: 0.7,
+            temperature: 0.6,
+            top_p: 0.9,
         }
     }
 }
@@ -43,30 +45,25 @@ pub type TokenCallback = Arc<dyn Fn(String) + Send + Sync>;
 pub type InferenceLogCallback = Arc<dyn Fn(String) + Send + Sync>;
 
 // ---------------------------------------------------------------------------
-// Chat template (matches the training template in dataset.rs)
+// Chat template — matches tokenizer_config.json:
+//   "{Role}: {content}<|eot_id|>" for each turn, then "Assistant: "
 // ---------------------------------------------------------------------------
+
+fn capitalize_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().to_string() + c.as_str(),
+    }
+}
 
 fn format_prompt(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     for msg in messages {
-        match msg.role.as_str() {
-            "system" => {
-                prompt.push_str("<|system|>\n");
-                prompt.push_str(&msg.content);
-                prompt.push_str("\n<|end|>\n");
-            }
-            "user" => {
-                prompt.push_str("<|user|>\n");
-                prompt.push_str(&msg.content);
-                prompt.push_str("\n<|end|>\n<|assistant|>\n");
-            }
-            "assistant" => {
-                prompt.push_str(&msg.content);
-                prompt.push_str("\n<|end|>\n");
-            }
-            _ => {}
-        }
+        let role = capitalize_first(&msg.role);
+        prompt.push_str(&format!("{}: {}<|eot_id|>", role, msg.content.trim()));
     }
+    prompt.push_str("Assistant: ");
     prompt
 }
 
@@ -74,15 +71,28 @@ fn format_prompt(messages: &[ChatMessage]) -> String {
 // Token sampling
 // ---------------------------------------------------------------------------
 
-fn sample_next(logits: &Tensor, temperature: f64, rng: &mut StdRng) -> Result<u32> {
+fn sample_next(logits: &Tensor, temperature: f64, top_p: f64, rng: &mut StdRng) -> Result<u32> {
     if temperature <= 0.0 {
         return Ok(logits.argmax(D::Minus1)?.to_scalar::<u32>()?);
     }
     let scaled = logits.affine(1.0 / temperature, 0.0)?;
     let probs = candle_nn::ops::softmax(&scaled.unsqueeze(0)?, D::Minus1)?;
-    let probs_vec: Vec<f32> = probs.squeeze(0)?.to_vec1()?;
-    // Clamp near-zero values so WeightedIndex doesn't fail
-    let probs_clamped: Vec<f32> = probs_vec.iter().map(|&p| p.max(1e-9)).collect();
+    let mut probs_vec: Vec<f32> = probs.squeeze(0)?.to_vec1()?;
+
+    // Top-p (nucleus) filtering
+    if top_p < 1.0 {
+        let mut indexed: Vec<(usize, f32)> = probs_vec.iter().copied().enumerate().collect();
+        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut cumsum = 0.0_f32;
+        for (idx, p) in &indexed {
+            cumsum += p;
+            if cumsum - p >= top_p as f32 {
+                probs_vec[*idx] = 0.0;
+            }
+        }
+    }
+
+    let probs_clamped: Vec<f32> = probs_vec.iter().map(|&p| p.max(0.0)).collect();
     let dist = WeightedIndex::new(&probs_clamped)
         .map_err(|e| anyhow::anyhow!("sampling distribution error: {e}"))?;
     Ok(dist.sample(rng) as u32)
@@ -112,7 +122,7 @@ pub fn run_inference(
     let bitnet_cfg = BitNetConfig::default();
     // rank=1 / alpha=1 → LoRA B is zero-initialised so contribution is zero;
     // effectively runs the base weights only.
-    let model = BitNetModel::new(&mmap.tensors, &bitnet_cfg, 1, 1.0, &device)?;
+    let model = BitNetModel::new(&mmap.tensors, &bitnet_cfg, 1, 1.0, &candle_core::Device::Cpu, &device)?;
     on_log("Model ready".into());
 
     // ── 2. Load tokenizer ─────────────────────────────────────────────────
@@ -122,22 +132,25 @@ pub fn run_inference(
     on_log("Tokenizer loaded".into());
 
     // ── 3. Tokenize prompt ────────────────────────────────────────────────
+    const BOS_ID: u32 = 128_000;
+    const EOS_IDS: &[u32] = &[128_001, 128_009]; // <|end_of_text|> and <|eot_id|>
+
     let prompt = format_prompt(&cfg.messages);
     let encoding = tokenizer
         .encode(prompt.as_str(), false)
         .map_err(|e| anyhow::anyhow!("tokenizer encode error: {e}"))?;
-    let mut token_ids: Vec<u32> = encoding.get_ids().to_vec();
+    let mut token_ids: Vec<u32> = std::iter::once(BOS_ID)
+        .chain(encoding.get_ids().iter().copied())
+        .collect();
     on_log(format!("Prompt: {} tokens. Generating…", token_ids.len()));
 
     // ── 4. Generation loop ────────────────────────────────────────────────
-    const STOP_STR: &str = "<|end|>";
-
     let mut rng = StdRng::from_entropy();
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut prev_streamed_len: usize = 0;
     let mut full_decoded = String::new();
 
-    'outer: for _ in 0..cfg.max_new_tokens {
+    for _ in 0..cfg.max_new_tokens {
         if *cancel_rx.borrow() {
             on_log("Generation cancelled.".into());
             break;
@@ -151,46 +164,28 @@ pub fn run_inference(
         // Slice last-position logits → [vocab]
         let last_logits = logits.narrow(1, seq_len - 1, 1)?.reshape((vocab,))?;
 
-        let next_id = sample_next(&last_logits, cfg.temperature, &mut rng)?;
+        let next_id = sample_next(&last_logits, cfg.temperature, cfg.top_p, &mut rng)?;
+
+        if EOS_IDS.contains(&next_id) {
+            break;
+        }
+
         generated_ids.push(next_id);
         token_ids.push(next_id);
 
-        // Decode all generated tokens to get the current full text
+        // Decode and stream incrementally
         full_decoded = tokenizer
-            .decode(&generated_ids, false)
+            .decode(&generated_ids, true)
             .map_err(|e| anyhow::anyhow!("decode error: {e}"))?;
 
-        // Stop and stream up to (but not including) the stop marker
-        if let Some(pos) = full_decoded.find(STOP_STR) {
-            let safe = char_boundary_floor(&full_decoded, pos);
-            if safe > prev_streamed_len {
-                on_token(full_decoded[prev_streamed_len..safe].to_string());
-            }
-            full_decoded.truncate(pos);
-            break 'outer;
-        }
-
-        // Hold back the last stop_len bytes to avoid streaming a partial marker
-        let hold_back = STOP_STR.len();
-        let safe_end = char_boundary_floor(&full_decoded, full_decoded.len().saturating_sub(hold_back));
+        let safe_end = char_boundary_floor(&full_decoded, full_decoded.len());
         if safe_end > prev_streamed_len {
             on_token(full_decoded[prev_streamed_len..safe_end].to_string());
             prev_streamed_len = safe_end;
         }
     }
 
-    // Flush any buffered text that didn't contain a stop marker
-    let trimmed = full_decoded[prev_streamed_len..]
-        .trim_end_matches(STOP_STR)
-        .trim_end();
-    if !trimmed.is_empty() {
-        on_token(trimmed.to_string());
-    }
-
-    Ok(full_decoded
-        .trim_end_matches(STOP_STR)
-        .trim_end()
-        .to_string())
+    Ok(full_decoded)
 }
 
 // Walk backwards from `pos` to find the nearest valid UTF-8 char boundary.

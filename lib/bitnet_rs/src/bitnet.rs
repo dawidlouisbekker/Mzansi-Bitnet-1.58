@@ -61,10 +61,34 @@ impl RmsNorm {
         let x_f32 = x.to_dtype(DType::F32)?;
         let rms = (x_f32.sqr()?.mean_keepdim(D::Minus1)? + self.eps)?.sqrt()?;
         let normed = x_f32.broadcast_div(&rms)?;
-        normed
-            .broadcast_mul(&self.weight.to_dtype(DType::F32)?)
-            .map_err(Into::into)
+        let w = self.weight.to_device(x.device())?.to_dtype(DType::F32)?;
+        normed.broadcast_mul(&w).map_err(Into::into)
     }
+}
+
+// ---------------------------------------------------------------------------
+// BitLinear — online W1.58A8 quantization matching the training regime
+// ---------------------------------------------------------------------------
+
+pub(crate) fn bitlinear_forward(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+    // Weight quantization: absmean → ternary {-1, 0, 1}
+    let w = w.to_device(x.device())?;
+    let w_f = w.to_dtype(DType::F32)?;
+    let w_scale = w_f.abs()?.mean_all()?.clamp(1e-8_f64, f64::MAX)?;
+    let w_q = w_f.broadcast_div(&w_scale)?.round()?.clamp(-1.0_f64, 1.0_f64)?;
+
+    // Activation quantization: absmax per-token → 8-bit
+    let x_f = x.to_dtype(DType::F32)?;
+    let x_scale = x_f
+        .abs()?
+        .max(D::Minus1)?
+        .unsqueeze(D::Minus1)?
+        .clamp(1e-8_f64, f64::MAX)?
+        .affine(1.0 / 127.0, 0.0)?;
+    let x_q = x_f.broadcast_div(&x_scale)?.round()?.clamp(-128.0_f64, 127.0_f64)?;
+
+    let out = x_q.matmul(&w_q.t()?)?.broadcast_mul(&x_scale)?.broadcast_mul(&w_scale)?;
+    Ok(out.to_dtype(x.dtype())?)
 }
 
 // ---------------------------------------------------------------------------
@@ -96,8 +120,8 @@ impl RotaryEmbedding {
 
     pub fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
         let seq = q.dim(2)?;
-        let cos = self.cos.narrow(0, offset, seq)?.unsqueeze(0)?.unsqueeze(0)?;
-        let sin = self.sin.narrow(0, offset, seq)?.unsqueeze(0)?.unsqueeze(0)?;
+        let cos = self.cos.narrow(0, offset, seq)?.to_device(q.device())?.unsqueeze(0)?.unsqueeze(0)?;
+        let sin = self.sin.narrow(0, offset, seq)?.to_device(q.device())?.unsqueeze(0)?.unsqueeze(0)?;
         Ok((rotate_half(q, &cos, &sin)?, rotate_half(k, &cos, &sin)?))
     }
 }
@@ -119,6 +143,7 @@ pub struct BitNetAttention {
     k_proj: LoraLinear,
     v_proj: LoraLinear,
     o_proj: LoraLinear,
+    attn_sub_norm: RmsNorm,
     head_dim: usize,
     num_heads: usize,
     num_kv_heads: usize,
@@ -147,6 +172,7 @@ impl BitNetAttention {
         let k_proj = LoraLinear::new(w("self_attn.k_proj")?, lora_rank, lora_alpha, device)?;
         let v_proj = LoraLinear::new(w("self_attn.v_proj")?, lora_rank, lora_alpha, device)?;
         let o_proj = LoraLinear::new(w("self_attn.o_proj")?, lora_rank, lora_alpha, device)?;
+        let attn_sub_norm = RmsNorm::new(w("self_attn.attn_sub_norm")?, cfg.rms_norm_eps);
 
         let rope = RotaryEmbedding::new(
             head_dim,
@@ -160,6 +186,7 @@ impl BitNetAttention {
             k_proj,
             v_proj,
             o_proj,
+            attn_sub_norm,
             head_dim,
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
@@ -201,7 +228,7 @@ impl BitNetAttention {
             .matmul(&v)?
             .transpose(1, 2)?
             .reshape((b, seq, self.num_heads * self.head_dim))?;
-
+        let out = self.attn_sub_norm.forward(&out)?;
         self.o_proj.forward(&out).map_err(Into::into)
     }
 
@@ -227,20 +254,23 @@ pub struct BitNetMlp {
     gate_proj: Tensor,
     up_proj: Tensor,
     down_proj: Tensor,
+    ffn_sub_norm: RmsNorm,
 }
 
 impl BitNetMlp {
-    pub fn new(weights: &HashMap<String, Tensor>, prefix: &str) -> Result<Self> {
+    pub fn new(weights: &HashMap<String, Tensor>, prefix: &str, cfg: &BitNetConfig) -> Result<Self> {
         let w = |name: &str| -> Result<Tensor> {
             weights
                 .get(&format!("{prefix}.{name}.weight"))
                 .with_context(|| format!("missing {prefix}.{name}.weight"))
                 .cloned()
         };
+        let ffn_sub_norm = RmsNorm::new(w("mlp.ffn_sub_norm")?, cfg.rms_norm_eps);
         Ok(Self {
             gate_proj: w("mlp.gate_proj")?,
             up_proj: w("mlp.up_proj")?,
             down_proj: w("mlp.down_proj")?,
+            ffn_sub_norm,
         })
     }
 
@@ -248,12 +278,13 @@ impl BitNetMlp {
         let x_shape = x.dims().to_vec();
         let in_dim = *x_shape.last().unwrap();
         let leading: usize = x_shape[..x_shape.len() - 1].iter().product();
-        let flat = x.reshape((leading, in_dim))?.to_dtype(DType::F32)?;
+        let flat = x.reshape((leading, in_dim))?;
 
-        let gate = flat.matmul(&self.gate_proj.to_dtype(DType::F32)?.t()?)?.relu()?.sqr()?;
-        let up = flat.matmul(&self.up_proj.to_dtype(DType::F32)?.t()?)?;
+        let gate = bitlinear_forward(&flat, &self.gate_proj)?.relu()?.sqr()?;
+        let up   = bitlinear_forward(&flat, &self.up_proj)?;
         let hidden = (gate * up)?;
-        let out = hidden.matmul(&self.down_proj.to_dtype(DType::F32)?.t()?)?;
+        let hidden = self.ffn_sub_norm.forward(&hidden)?;
+        let out = bitlinear_forward(&hidden, &self.down_proj)?;
 
         let out_features = out.dim(1)?;
         let mut out_shape = x_shape;
@@ -292,7 +323,7 @@ impl BitNetDecoderLayer {
 
         Ok(Self {
             attn: BitNetAttention::new(weights, &prefix, cfg, lora_rank, lora_alpha, device)?,
-            mlp: BitNetMlp::new(weights, &prefix)?,
+            mlp: BitNetMlp::new(weights, &prefix, cfg)?,
             input_norm: RmsNorm::new(w("input_layernorm.weight")?, cfg.rms_norm_eps),
             post_attn_norm: RmsNorm::new(w("post_attention_layernorm.weight")?, cfg.rms_norm_eps),
         })
@@ -323,6 +354,7 @@ pub struct BitNetModel {
     layers: Vec<BitNetDecoderLayer>,
     norm: RmsNorm,
     lm_head: Tensor,
+    compute_device: Device,
 }
 
 impl BitNetModel {
@@ -332,6 +364,7 @@ impl BitNetModel {
         lora_rank: usize,
         lora_alpha: f64,
         device: &Device,
+        compute_device: &Device,
     ) -> Result<Self> {
         let w = |name: &str| -> Result<Tensor> {
             weights
@@ -351,19 +384,22 @@ impl BitNetModel {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Self { embed, layers, norm, lm_head })
+        Ok(Self { embed, layers, norm, lm_head, compute_device: compute_device.clone() })
     }
 
     /// Forward pass. Returns logits `[batch, seq, vocab]`.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
         let (b, seq) = input_ids.dims2()?;
-        let flat_ids = input_ids.reshape((b * seq,))?;
-        let mut x = self.embed.index_select(&flat_ids, 0)?
+        // Embedding lookup on CPU (embed lives on CPU), then move activations to compute device
+        let cpu_ids = input_ids.to_device(&Device::Cpu)?;
+        let flat_ids = cpu_ids.reshape((b * seq,))?;
+        let mut x = self.embed
+            .index_select(&flat_ids, 0)?
             .reshape((b, seq, self.embed.dim(1)?))?
-            .to_dtype(DType::F32)?;
+            .to_dtype(DType::F32)?
+            .to_device(&self.compute_device)?;
 
-        // Causal mask
-        let mask = causal_mask(seq, x.dtype(), x.device())?;
+        let mask = causal_mask(seq, x.dtype(), &self.compute_device)?;
 
         for layer in &self.layers {
             x = layer.forward(&x, 0, Some(&mask))?;
@@ -372,7 +408,10 @@ impl BitNetModel {
         x = self.norm.forward(&x)?;
         let (b, seq, hidden) = x.dims3()?;
         let flat = x.reshape((b * seq, hidden))?;
-        let logits_flat = flat.matmul(&self.lm_head.to_dtype(DType::F32)?.t()?)?;
+        // lm_head in BF16 (655 MB) to avoid the 1.31 GB F32 copy that caused OOM
+        let lm_head = self.lm_head.to_device(&self.compute_device)?;
+        let flat_bf16 = flat.to_dtype(DType::BF16)?;
+        let logits_flat = flat_bf16.matmul(&lm_head.t()?)?.to_dtype(DType::F32)?;
         let vocab = logits_flat.dim(1)?;
         logits_flat.reshape((b, seq, vocab)).map_err(Into::into)
     }

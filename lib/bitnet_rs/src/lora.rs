@@ -1,6 +1,8 @@
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor, Var};
 
+use crate::bitnet::bitlinear_forward;
+
 /// A linear layer whose output is `base(x) + scale * (x @ A^T @ B^T)`.
 ///
 /// Only `a` and `b` hold gradients; the frozen `base` weight never accumulates one.
@@ -34,6 +36,7 @@ impl LoraLinear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let dev = x.device();
         let x_shape = x.dims().to_vec();
         let in_dim = *x_shape.last().unwrap();
         let leading: usize = x_shape[..x_shape.len() - 1].iter().product();
@@ -41,10 +44,12 @@ impl LoraLinear {
         let flat = x.reshape((leading, in_dim))?;
 
         let flat_f32 = flat.to_dtype(DType::F32)?;
-        let base_out = flat_f32.matmul(&self.base.to_dtype(DType::F32)?.t()?)?;
+        let base_out = bitlinear_forward(&flat_f32, &self.base)?;
+        let a = self.a.as_tensor().to_device(dev)?;
+        let b = self.b.as_tensor().to_device(dev)?;
         let lora_out = flat_f32
-            .matmul(&self.a.as_tensor().t()?)?
-            .matmul(&self.b.as_tensor().t()?)?
+            .matmul(&a.t()?)?
+            .matmul(&b.t()?)?
             .affine(self.scale, 0.0)?;
 
         let combined = (base_out + lora_out)?;

@@ -2,3 +2,5 @@
 # RTX 3050 Ti Mobile (GA107, Ampere) — compute capability 8.6
 # Required by candle-kernels when nvidia-smi is not in PATH
 CUDA_COMPUTE_CAP = "86"
+# CUDA 12.0 installed via apt — headers/libs are under /usr, not /usr/local/cuda
+CUDA_ROOT = "/usr"

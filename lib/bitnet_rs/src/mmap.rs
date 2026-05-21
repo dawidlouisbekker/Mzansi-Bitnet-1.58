@@ -19,7 +19,7 @@ pub struct MmapWeights {
 ///
 /// The OS loads pages on demand (not upfront), so startup is fast even for 4 GB models.
 /// All tensors are loaded onto `device` in their stored dtype (bf16 for BitNet weights).
-pub fn load_mmap(path: &Path, device: &Device) -> Result<MmapWeights> {
+pub fn load_mmap(path: &Path, _device: &Device) -> Result<MmapWeights> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("cannot open {}", path.display()))?;
 
@@ -36,7 +36,7 @@ pub fn load_mmap(path: &Path, device: &Device) -> Result<MmapWeights> {
     for (name, view) in st.tensors() {
         let shape: Vec<usize> = view.shape().to_vec();
         let dtype = st_dtype_to_candle(view.dtype())?;
-        let tensor = Tensor::from_raw_buffer(view.data(), dtype, &shape, device)
+        let tensor = Tensor::from_raw_buffer(view.data(), dtype, &shape, &Device::Cpu)
             .with_context(|| format!("tensor {name} failed to load"))?;
         tensors.insert(name.to_string(), tensor);
     }
