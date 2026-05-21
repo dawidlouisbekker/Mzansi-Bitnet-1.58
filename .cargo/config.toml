@@ -1,0 +1,4 @@
+[env]
+# RTX 3050 Ti Mobile (GA107, Ampere) — compute capability 8.6
+# Required by candle-kernels when nvidia-smi is not in PATH
+CUDA_COMPUTE_CAP = "86"
