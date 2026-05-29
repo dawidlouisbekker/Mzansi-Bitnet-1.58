@@ -1,14 +1,34 @@
-/// BitNet b1.58 2B architecture implemented with candle.
+/// BitNet b1.58 2B architecture.
 ///
 /// Config matches ./models/bitnet-b1.58-2b-4t-bf16/config.json:
 ///   hidden_size=2560, num_hidden_layers=30, num_attention_heads=20,
 ///   num_key_value_heads=5, intermediate_size=6912, rope_theta=500000.
+///
+/// Matrix multiplications in BitLinear layers are dispatched to cuBLAS via
+/// cuda_rs when the `cuda` feature is enabled; everything else (norms, RoPE,
+/// softmax, residuals) stays on the CPU through candle.
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor, D};
 
 use crate::lora::LoraLinear;
+
+// ---------------------------------------------------------------------------
+// Global cuBLAS handle (initialised once, reused for every matmul)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda_rs")]
+mod gpu {
+    use cuda_rs::CublasHandle;
+    use std::sync::OnceLock;
+
+    static HANDLE: OnceLock<Option<CublasHandle>> = OnceLock::new();
+
+    pub(super) fn handle() -> Option<&'static CublasHandle> {
+        HANDLE.get_or_init(|| CublasHandle::new().ok()).as_ref()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -71,13 +91,18 @@ impl RmsNorm {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn bitlinear_forward(x: &Tensor, w: &Tensor) -> Result<Tensor> {
-    // Weight quantization: absmean → ternary {-1, 0, 1}
-    let w = w.to_device(x.device())?;
+    #[cfg(feature = "cuda_rs")]
+    if let Some(h) = gpu::handle() {
+        return bitlinear_gpu(x, w, h);
+    }
+    bitlinear_cpu(x, w)
+}
+
+fn bitlinear_cpu(x: &Tensor, w: &Tensor) -> Result<Tensor> {
     let w_f = w.to_dtype(DType::F32)?;
     let w_scale = w_f.abs()?.mean_all()?.clamp(1e-8_f64, f64::MAX)?;
     let w_q = w_f.broadcast_div(&w_scale)?.round()?.clamp(-1.0_f64, 1.0_f64)?;
 
-    // Activation quantization: absmax per-token → 8-bit
     let x_f = x.to_dtype(DType::F32)?;
     let x_scale = x_f
         .abs()?
@@ -89,6 +114,72 @@ pub(crate) fn bitlinear_forward(x: &Tensor, w: &Tensor) -> Result<Tensor> {
 
     let out = x_q.matmul(&w_q.t()?)?.broadcast_mul(&x_scale)?.broadcast_mul(&w_scale)?;
     Ok(out.to_dtype(x.dtype())?)
+}
+
+/// GPU-accelerated BitLinear matmul via cuBLAS INT8.
+///
+/// Quantises weights (absmean → ternary i8) and activations (absmax per-token
+/// → i8) on CPU, ships them to GPU, runs `cublasGemmEx` (INT8→I32), then
+/// rescales the I32 result back to F32 on CPU.
+#[cfg(feature = "cuda_rs")]
+fn bitlinear_gpu(x: &Tensor, w: &Tensor, handle: &cuda_rs::CublasHandle) -> Result<Tensor> {
+    use cuda_rs::DeviceBuffer;
+
+    let orig_shape = x.dims().to_vec();
+    let k = *orig_shape.last().unwrap();
+    let m: usize = orig_shape[..orig_shape.len() - 1].iter().product();
+
+    // ── Weight quantization (CPU) ────────────────────────────────────────────
+    let w_f: Vec<f32> = w.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    let (n, _k) = w.dims2()?; // w is [out_features, in_features]
+    let w_abs_sum: f32 = w_f.iter().map(|v| v.abs()).sum::<f32>();
+    let w_scale = (w_abs_sum / w_f.len() as f32).max(1e-8_f32);
+
+    // Quantise and transpose w to [K, N] row-major (required by matmul_i8_i32)
+    let mut w_qt: Vec<i8> = vec![0i8; k * n];
+    for row in 0..n {
+        for col in 0..k {
+            let v = (w_f[row * k + col] / w_scale).round().clamp(-1.0, 1.0);
+            w_qt[col * n + row] = v as i8;
+        }
+    }
+    let w_gpu = DeviceBuffer::<i8>::from_slice(&w_qt)
+        .map_err(|e| anyhow::anyhow!("w upload: {e}"))?;
+
+    // ── Activation quantization (CPU) ────────────────────────────────────────
+    let x_f: Vec<f32> = x.to_dtype(DType::F32)?.reshape((m, k))?.flatten_all()?.to_vec1()?;
+    let x_scales: Vec<f32> = x_f.chunks(k)
+        .map(|row| row.iter().cloned().fold(0.0_f32, f32::max).max(1e-8_f32) / 127.0)
+        .collect();
+
+    let x_qi8: Vec<i8> = x_f.chunks(k).zip(x_scales.iter())
+        .flat_map(|(row, &s)| row.iter().map(move |&v| (v / s).round().clamp(-128.0, 127.0) as i8))
+        .collect();
+    let x_gpu = DeviceBuffer::<i8>::from_slice(&x_qi8)
+        .map_err(|e| anyhow::anyhow!("x upload: {e}"))?;
+
+    // ── cuBLAS INT8 matmul → I32 ─────────────────────────────────────────────
+    let mut out_gpu = DeviceBuffer::<i32>::uninit(m * n)
+        .map_err(|e| anyhow::anyhow!("out alloc: {e}"))?;
+    handle.matmul_i8_i32(m, n, k, &x_gpu, &w_gpu, &mut out_gpu)
+        .map_err(|e| anyhow::anyhow!("matmul: {e}"))?;
+    let out_i32 = out_gpu.to_vec()
+        .map_err(|e| anyhow::anyhow!("out download: {e}"))?;
+
+    // ── Rescale I32 → F32, restore original shape ────────────────────────────
+    let out_f32: Vec<f32> = out_i32.chunks(n).zip(x_scales.iter())
+        .flat_map(|(row, &xs)| row.iter().map(move |&v| v as f32 * xs * w_scale))
+        .collect();
+
+    let flat = Tensor::from_vec(out_f32, (m, n), x.device())?;
+    let out = flat.to_dtype(x.dtype())?;
+
+    if orig_shape.len() > 2 {
+        let mut out_shape = orig_shape;
+        *out_shape.last_mut().unwrap() = n;
+        return Ok(out.reshape(out_shape)?);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +445,6 @@ pub struct BitNetModel {
     layers: Vec<BitNetDecoderLayer>,
     norm: RmsNorm,
     lm_head: Tensor,
-    compute_device: Device,
 }
 
 impl BitNetModel {
@@ -364,7 +454,6 @@ impl BitNetModel {
         lora_rank: usize,
         lora_alpha: f64,
         device: &Device,
-        compute_device: &Device,
     ) -> Result<Self> {
         let w = |name: &str| -> Result<Tensor> {
             weights
@@ -375,32 +464,25 @@ impl BitNetModel {
 
         let embed = w("model.embed_tokens.weight")?;
         let norm = RmsNorm::new(w("model.norm.weight")?, cfg.rms_norm_eps);
-        // BitNet ties word embeddings — lm_head == embed_tokens
-        let lm_head = embed.clone();
+        let lm_head = embed.clone(); // BitNet ties word embeddings
 
         let layers = (0..cfg.num_hidden_layers)
-            .map(|i| {
-                BitNetDecoderLayer::new(weights, i, cfg, lora_rank, lora_alpha, device)
-            })
+            .map(|i| BitNetDecoderLayer::new(weights, i, cfg, lora_rank, lora_alpha, device))
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Self { embed, layers, norm, lm_head, compute_device: compute_device.clone() })
+        Ok(Self { embed, layers, norm, lm_head })
     }
 
     /// Forward pass. Returns logits `[batch, seq, vocab]`.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
         let (b, seq) = input_ids.dims2()?;
-        // Embedding lookup on CPU (embed lives on CPU), then move activations to compute device
-        let cpu_ids = input_ids.to_device(&Device::Cpu)?;
-        let flat_ids = cpu_ids.reshape((b * seq,))?;
+        let flat_ids = input_ids.reshape((b * seq,))?;
         let mut x = self.embed
             .index_select(&flat_ids, 0)?
             .reshape((b, seq, self.embed.dim(1)?))?
-            .to_dtype(DType::F32)?
-            .to_device(&self.compute_device)?;
+            .to_dtype(DType::F32)?;
 
-        let mask = causal_mask(seq, x.dtype(), &self.compute_device)?;
-
+        let mask = causal_mask(seq, x.dtype(), x.device())?;
         for layer in &self.layers {
             x = layer.forward(&x, 0, Some(&mask))?;
         }
@@ -408,10 +490,9 @@ impl BitNetModel {
         x = self.norm.forward(&x)?;
         let (b, seq, hidden) = x.dims3()?;
         let flat = x.reshape((b * seq, hidden))?;
-        // lm_head in BF16 (655 MB) to avoid the 1.31 GB F32 copy that caused OOM
-        let lm_head = self.lm_head.to_device(&self.compute_device)?;
+        // lm_head stored in BF16 (655 MB vs 1.31 GB in F32) to keep within 4 GB VRAM budget
         let flat_bf16 = flat.to_dtype(DType::BF16)?;
-        let logits_flat = flat_bf16.matmul(&lm_head.t()?)?.to_dtype(DType::F32)?;
+        let logits_flat = flat_bf16.matmul(&self.lm_head.t()?)?.to_dtype(DType::F32)?;
         let vocab = logits_flat.dim(1)?;
         logits_flat.reshape((b, seq, vocab)).map_err(Into::into)
     }

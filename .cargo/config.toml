@@ -1,6 +1,15 @@
 [env]
 # RTX 3050 Ti Mobile (GA107, Ampere) — compute capability 8.6
-# Required by candle-kernels when nvidia-smi is not in PATH
-CUDA_COMPUTE_CAP = "86"
-# CUDA 12.0 installed via apt — headers/libs are under /usr, not /usr/local/cuda
-CUDA_ROOT = "/usr"
+CUDA_COMPUTE_CAP = { value = "86", force = true }
+
+# cudarc 0.19.7 version-env format: {major}0{minor}0  →  13.2 = "13020"
+# force = true overrides any stale shell value (e.g. "13.2" or "13.3")
+CUDARC_CUDA_VERSION = { value = "13020", force = true }
+
+CUDA_PATH             = { value = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3', force = false }
+CUDA_HOME             = { value = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3', force = false }
+CUDA_ROOT             = { value = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3', force = false }
+CUDA_TOOLKIT_ROOT_DIR = { value = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3', force = false }
+
+# nvcc on Windows needs cl.exe — point it at the MSVC x64 compiler
+NVCC_CCBIN = { value = 'C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64', force = false }

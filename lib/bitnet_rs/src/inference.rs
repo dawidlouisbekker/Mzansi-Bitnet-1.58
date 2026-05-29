@@ -122,7 +122,7 @@ pub fn run_inference(
     let bitnet_cfg = BitNetConfig::default();
     // rank=1 / alpha=1 → LoRA B is zero-initialised so contribution is zero;
     // effectively runs the base weights only.
-    let model = BitNetModel::new(&mmap.tensors, &bitnet_cfg, 1, 1.0, &candle_core::Device::Cpu, &device)?;
+    let model = BitNetModel::new(&mmap.tensors, &bitnet_cfg, 1, 1.0, &candle_core::Device::Cpu)?;
     on_log("Model ready".into());
 
     // ── 2. Load tokenizer ─────────────────────────────────────────────────

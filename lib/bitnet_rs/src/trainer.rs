@@ -76,7 +76,6 @@ pub fn run_training(
         cfg.lora_rank,
         cfg.lora_alpha,
         &device,
-        &device,
     )?;
     on_log("Model ready".into());
 

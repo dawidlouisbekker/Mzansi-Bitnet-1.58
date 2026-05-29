@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [features]
 default = ["cuda"]
-cuda = ["candle-core/cuda"]
+cuda = ["cuda_rs"]
 
 [dependencies]
 candle-core = "0.10"
@@ -22,3 +22,4 @@ anyhow      = "1"
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 rand        = "0.8"
+cuda_rs     = { path = "../cuda_rs", optional = true }

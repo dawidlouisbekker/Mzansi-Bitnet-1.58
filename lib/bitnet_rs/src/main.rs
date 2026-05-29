@@ -1,4 +1,4 @@
-use std::{ffi::NulError, io::Write as _};
+use std::{io::Write as _};
 use std::sync::Arc;
 
 use tokio::sync::watch;
@@ -6,16 +6,25 @@ use tokio::sync::watch;
 use bitnet_rs::{run_inference, ChatMessage, InferenceConfig};
 
 // Data  structure size in bytes
+/* 
 fn ds_size() {
     use std::mem::size_of;
     eprintln!("Sizes:");
     eprintln!("  String: {} bytes", size_of::<Arc<NulError>>());
     eprintln!("  InferenceConfig: {} bytes", size_of::<InferenceConfig>());
 }
-
+*/
 fn main() {
 
-    let mut model       = "./models/bitnet-b1.58-2b-4t-bf16".to_string();
+    // Derive workspace root from executable location:
+    // target/{profile}/bitnet-cli.exe → parent → parent → parent → workspace root
+    let mut model = std::env::current_exe()
+        .ok()
+        .and_then(|p| {
+            p.parent()?.parent()?.parent()
+                .map(|root| root.join("models").join("bitnet-b1.58-2b-4t-bf16").to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "./models/bitnet-b1.58-2b-4t-bf16".to_string());
     let mut prompt      = String::new();
     let mut system      = String::new();
     let mut temperature    = 0.6_f64;
