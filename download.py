@@ -17,12 +17,12 @@ import sys
 from dotenv import load_dotenv
 from huggingface_hub import snapshot_download
 
-load_dotenv()  # Load environment variables from .env file
+load_dotenv(".env")  # Load environment variables from .env file
 
 MODEL_ID = "microsoft/bitnet-b1.58-2B-4T-bf16"
 LOCAL_DIR = "./models/bitnet-b1.58-2b-4t-bf16"
 
-token = os.environ.get("HF_TOKEN")
+token = os.environ.get("HF_BITNET_TOKEN")
 if not token:
     print("Error: HF_BITNET_TOKEN environment variable is not set.")
     print("Get your token from https://huggingface.co/settings/tokens")
